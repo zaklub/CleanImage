@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 
-MaskMode = Literal["otsu", "variance"]
+MaskMode = Literal["otsu", "variance", "grabcut"]
 
 
 def _compute_mask_otsu(
@@ -55,6 +55,54 @@ def _compute_mask_variance(
     return mask
 
 
+def _compute_mask_grabcut(
+    color_img: np.ndarray,
+    morph_kernel: int,
+    dilate_iters: int,
+    vertical_margin_ratio: float,
+    horizontal_margin_ratio: float,
+    iterations: int,
+) -> np.ndarray:
+    h, w = color_img.shape[:2]
+    mask = np.full((h, w), cv2.GC_PR_BGD, np.uint8)
+
+    v_margin = int(max(1, vertical_margin_ratio * h))
+    h_margin = int(max(1, horizontal_margin_ratio * w))
+
+    mask[:v_margin, :] = cv2.GC_BGD
+    mask[h - v_margin :, :] = cv2.GC_BGD
+    mask[v_margin : h - v_margin, h_margin : w - h_margin] = cv2.GC_PR_FGD
+
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    cv2.grabCut(
+        color_img,
+        mask,
+        None,
+        bgd_model,
+        fgd_model,
+        max(1, iterations),
+        cv2.GC_INIT_WITH_MASK,
+    )
+
+    binary_mask = np.where(
+        (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
+    ).astype(np.uint8)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_kernel, morph_kernel))
+    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+    binary_mask = cv2.dilate(binary_mask, kernel, iterations=dilate_iters)
+
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        binary_mask[:] = 0
+        cv2.drawContours(binary_mask, [max(contours, key=cv2.contourArea)], -1, 255, -1)
+
+    return binary_mask
+
+
 def denoise_truck_xray(
     input_path: str,
     mask_path: str = "mask_container.png",
@@ -68,12 +116,16 @@ def denoise_truck_xray(
     mask_mode: MaskMode = "otsu",
     variance_kernel: int = 15,
     variance_percentile: float = 70.0,
+    grabcut_iterations: int = 5,
+    vertical_margin_ratio: float = 0.12,
+    horizontal_margin_ratio: float = 0.05,
 ) -> None:
     """Auto-mask the truck/container region and selectively denoise the image."""
-    img = cv2.imread(input_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
+    color_img = cv2.imread(input_path, cv2.IMREAD_COLOR)
+    if color_img is None:
         raise FileNotFoundError(f"Could not open input image: {input_path}")
-    img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    gray_img = cv2.cvtColor(color_img, cv2.COLOR_BGR2GRAY)
+    img = cv2.normalize(gray_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
     if mask_mode == "otsu":
         mask = _compute_mask_otsu(img, morph_kernel, dilate_iters)
@@ -84,6 +136,15 @@ def denoise_truck_xray(
             dilate_iters=dilate_iters,
             variance_kernel=variance_kernel,
             variance_percentile=variance_percentile,
+        )
+    elif mask_mode == "grabcut":
+        mask = _compute_mask_grabcut(
+            color_img,
+            morph_kernel=morph_kernel,
+            dilate_iters=dilate_iters,
+            vertical_margin_ratio=vertical_margin_ratio,
+            horizontal_margin_ratio=horizontal_margin_ratio,
+            iterations=grabcut_iterations,
         )
     else:
         raise ValueError(f"Unsupported mask_mode: {mask_mode}")
@@ -166,7 +227,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mask-mode",
-        choices=["otsu", "variance"],
+        choices=["otsu", "variance", "grabcut"],
         default="otsu",
         help="Strategy used to build the container mask.",
     )
@@ -181,6 +242,24 @@ if __name__ == "__main__":
         type=float,
         default=70.0,
         help="Percentile threshold for variance masking (higher -> tighter mask).",
+    )
+    parser.add_argument(
+        "--grabcut-iters",
+        type=int,
+        default=5,
+        help="Number of GrabCut refinement iterations when mask-mode=grabcut.",
+    )
+    parser.add_argument(
+        "--grabcut-vertical-margin",
+        type=float,
+        default=0.12,
+        help="Vertical margin ratio (0-0.5) treated as definite background for GrabCut.",
+    )
+    parser.add_argument(
+        "--grabcut-horizontal-margin",
+        type=float,
+        default=0.05,
+        help="Horizontal margin ratio treated as probable foreground for GrabCut.",
     )
 
     args = parser.parse_args()
@@ -197,5 +276,8 @@ if __name__ == "__main__":
         mask_mode=args.mask_mode,  # type: ignore[arg-type]
         variance_kernel=args.variance_kernel,
         variance_percentile=args.variance_percentile,
+        grabcut_iterations=args.grabcut_iters,
+        vertical_margin_ratio=args.grabcut_vertical_margin,
+        horizontal_margin_ratio=args.grabcut_horizontal_margin,
     )
 
